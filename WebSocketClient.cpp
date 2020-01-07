@@ -1,321 +1,127 @@
-//#define DEBUGGING
+/*
+Websocket-Arduino, a websocket implementation for Arduino
+Copyright 2011 Per Ejeklint
 
-#include "global.h"
-#include "WebSocketClient.h"
+Based on previous implementations by
+Copyright 2010 Ben Swanson
+and
+Copyright 2010 Randall Brewer
+and
+Copyright 2010 Oliver Smith
 
-#include "sha1.h"
-#include "base64.h"
+Some code and concept based off of Webduino library
+Copyright 2009 Ben Combee, Ran Talbott
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+-------------
+Now based off
+http://www.whatwg.org/specs/web-socket-protocol/
+
+- OLD -
+Currently based off of "The Web Socket protocol" draft (v 75):
+http://tools.ietf.org/html/draft-hixie-thewebsocketprotocol-75
+*/
 
 
-bool WebSocketClient::handshake(Client &client) {
+#ifndef WEBSOCKETCLIENT_H_
+#define WEBSOCKETCLIENT_H_
 
-    socket_client = &client;
+#include <Arduino.h>
+#include <Stream.h>
+#include "String.h"
+#include "Client.h"
 
-    // If there is a connected client->
-    if (socket_client->connected()) {
-        // Check request and look for websocket handshake
-#ifdef DEBUGGING
-            Serial.println(F("Client connected"));
+// CRLF characters to terminate lines/handshakes in headers.
+#define CRLF "\r\n"
+
+// Amount of time (in ms) a user may be connected before getting disconnected 
+// for timing out (i.e. not sending any data to the server).
+#define TIMEOUT_IN_MS 10000
+
+// ACTION_SPACE is how many actions are allowed in a program. Defaults to 
+// 5 unless overwritten by user.
+#ifndef CALLBACK_FUNCTIONS
+#define CALLBACK_FUNCTIONS 1
 #endif
-        if (analyzeRequest()) {
-#ifdef DEBUGGING
-                Serial.println(F("Websocket established"));
+
+// Don't allow the client to send big frames of data. This will flood the Arduinos
+// memory and might even crash it.
+#ifndef MAX_FRAME_LENGTH
+#define MAX_FRAME_LENGTH 64
 #endif
 
-                return true;
+#define SIZE(array) (sizeof(array) / sizeof(*array))
 
-        } else {
-            // Might just need to break until out of socket_client loop.
-#ifdef DEBUGGING
-            Serial.println(F("Invalid handshake"));
-#endif
-            disconnectStream();
+// WebSocket protocol constants
+// First byte
+#define WS_FIN            0x80
+#define WS_OPCODE_TEXT    0x01
+#define WS_OPCODE_BINARY  0x02
+#define WS_OPCODE_CLOSE   0x08
+#define WS_OPCODE_PING    0x09
+#define WS_OPCODE_PONG    0x0a
+// Second byte
+#define WS_MASK           0x80
+#define WS_SIZE16         126
+#define WS_SIZE64         127
 
-            return false;
-        }
-    } else {
-        return false;
-    }
-}
+  
+class WebSocketClient {
+public:
 
-bool WebSocketClient::analyzeRequest() {
-    String temp;
-
-    int bite;
-    bool foundupgrade = false;
-    unsigned long intkey[2];
-    String serverKey;
-    char keyStart[17];
-    char b64Key[25];
-    String key = "------------------------";
-
-    randomSeed(analogRead(0));
-
-    for (int i=0; i<16; ++i) {
-        keyStart[i] = (char)random(1, 256);
-    }
-
-    base64_encode(b64Key, keyStart, 16);
-
-    for (int i=0; i<24; ++i) {
-        key[i] = b64Key[i];
-    }
-
-#ifdef DEBUGGING
-    Serial.println(F("Sending websocket upgrade headers"));
-#endif    
-
-    socket_client->print(F("GET "));
-    socket_client->print(path);
-    socket_client->print(F(" HTTP/1.1\r\n"));
-    socket_client->print(F("Upgrade: websocket\r\n"));
-    socket_client->print(F("Connection: Upgrade\r\n"));
-    socket_client->print(F("Host: "));
-    socket_client->print(host);
-    socket_client->print(CRLF); 
-    socket_client->print(F("Sec-WebSocket-Key: "));
-    socket_client->print(key);
-    socket_client->print(CRLF);
-    socket_client->print(F("Sec-WebSocket-Protocol: "));
-    socket_client->print(protocol);
-    socket_client->print(CRLF);
-    socket_client->print(F("Sec-WebSocket-Version: 13\r\n"));
-    socket_client->print(CRLF);
-
-#ifdef DEBUGGING
-    Serial.println(F("Analyzing response headers"));
-#endif    
-
-    while (socket_client->connected() && !socket_client->available()) {
-        delay(100);
-        Serial.println("Waiting...");
-    }
-
-    // TODO: More robust string extraction
-    while ((bite = socket_client->read()) != -1) {
-
-        temp += (char)bite;
-
-        if ((char)bite == '\n') {
-#ifdef DEBUGGING
-            Serial.print("Got Header: " + temp);
-#endif
-            if (!foundupgrade && temp.startsWith("Upgrade: websocket")) {
-                foundupgrade = true;
-            } else if (temp.startsWith("Sec-WebSocket-Accept: ")) {
-                serverKey = temp.substring(22,temp.length() - 2); // Don't save last CR+LF
-            }
-            temp = "";		
-        }
-
-        if (!socket_client->available()) {
-          delay(20);
-        }
-    }
-
-    key += "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    uint8_t *hash;
-    char result[21];
-    char b64Result[30];
-
-    Sha1.init();
-    Sha1.print(key);
-    hash = Sha1.result();
-
-    for (int i=0; i<20; ++i) {
-        result[i] = (char)hash[i];
-    }
-    result[20] = '\0';
-
-    base64_encode(b64Result, result, 20);
-
-    // if the keys match, good to go
-    return serverKey.equals(String(b64Result));
-}
-
-
-bool WebSocketClient::handleStream(String& data, uint8_t *opcode) {
-    uint8_t msgtype;
-    uint8_t bite;
-    unsigned int length;
-    uint8_t mask[4];
-    uint8_t index;
-    unsigned int i;
-    bool hasMask = false;
-
-    if (!socket_client->connected() || !socket_client->available())
-    {
-        return false;
-    }      
-
-    msgtype = timedRead();
-    if (!socket_client->connected()) {
-        return false;
-    }
-
-    length = timedRead();
-
-    if (length & WS_MASK) {
-        hasMask = true;
-        length = length & ~WS_MASK;
-    }
-
-
-    if (!socket_client->connected()) {
-        return false;
-    }
-
-    index = 6;
-
-    if (length == WS_SIZE16) {
-        length = timedRead() << 8;
-        if (!socket_client->connected()) {
-            return false;
-        }
-            
-        length |= timedRead();
-        if (!socket_client->connected()) {
-            return false;
-        }   
-
-    } else if (length == WS_SIZE64) {
-#ifdef DEBUGGING
-        Serial.println(F("No support for over 16 bit sized messages"));
-#endif
-        return false;
-    }
-
-    if (hasMask) {
-        // get the mask
-        mask[0] = timedRead();
-        if (!socket_client->connected()) {
-            return false;
-        }
-
-        mask[1] = timedRead();
-        if (!socket_client->connected()) {
-
-            return false;
-        }
-
-        mask[2] = timedRead();
-        if (!socket_client->connected()) {
-            return false;
-        }
-
-        mask[3] = timedRead();
-        if (!socket_client->connected()) {
-            return false;
-        }
-    }
-        
-    data = "";
-        
-    if (opcode != NULL)
-    {
-      *opcode = msgtype & ~WS_FIN;
-    }
-                
-    if (hasMask) {
-        for (i=0; i<length; ++i) {
-            data += (char) (timedRead() ^ mask[i % 4]);
-            if (!socket_client->connected()) {
-                return false;
-            }
-        }
-    } else {
-        for (i=0; i<length; ++i) {
-            data += (char) timedRead();
-            if (!socket_client->connected()) {
-                return false;
-            }
-        }            
-    }
+    // Handle connection requests to validate and process/refuse
+    // connections.
+    bool handshake(Client &client);
     
-    return true;
-}
+    // Get data off of the stream
+    bool getData(String& data, uint8_t *opcode = NULL);
 
-void WebSocketClient::disconnectStream() {
-#ifdef DEBUGGING
-    Serial.println(F("Terminating socket"));
-#endif
-    // Should send 0x8700 to server to tell it I'm quitting here.
-    socket_client->write((uint8_t) 0x87);
-    socket_client->write((uint8_t) 0x00);
+    // Write data to the stream
+    void sendData(const char *str, uint8_t opcode = WS_OPCODE_TEXT);
+    void sendData(String str, uint8_t opcode = WS_OPCODE_TEXT);
+
+    char *path;
+    char *host;
+    char *protocol;
+
+private:
+    Client *socket_client;
+    unsigned long _startMillis;
+
+    const char *socket_urlPrefix;
+
+    // Discovers if the client's header is requesting an upgrade to a
+    // websocket connection.
+    bool analyzeRequest();
+
+    bool handleStream(String& data, uint8_t *opcode);    
     
-    socket_client->flush();
-    delay(10);
-    socket_client->stop();
-}
-
-bool WebSocketClient::getData(String& data, uint8_t *opcode) {
-    return handleStream(data, opcode);
-}    
-
-void WebSocketClient::sendData(const char *str, uint8_t opcode) {
-#ifdef DEBUGGING
-    Serial.print(F("Sending data: "));
-    Serial.println(str);
-#endif
-    if (socket_client->connected()) {
-        sendEncodedData(str, opcode);       
-    }
-}
-
-void WebSocketClient::sendData(String str, uint8_t opcode) {
-#ifdef DEBUGGING
-    Serial.print(F("Sending data: "));
-    Serial.println(str);
-#endif
-    if (socket_client->connected()) {
-        sendEncodedData(str, opcode);
-    }
-}
-
-int WebSocketClient::timedRead() {
-  while (!socket_client->available()) {
-    delay(20);  
-  }
-
-  return socket_client->read();
-}
-
-void WebSocketClient::sendEncodedData(char *str, uint8_t opcode) {
-    uint8_t mask[4];
-    int size = strlen(str);
-
-    // Opcode; final fragment
-    socket_client->write(opcode | WS_FIN);
-
-    // NOTE: no support for > 16-bit sized messages
-    if (size > 125) {
-        socket_client->write(WS_SIZE16 | WS_MASK);
-        socket_client->write((uint8_t) (size >> 8));
-        socket_client->write((uint8_t) (size & 0xFF));
-    } else {
-        socket_client->write((uint8_t) size | WS_MASK);
-    }
-
-    mask[0] = random(0, 256);
-    mask[1] = random(0, 256);
-    mask[2] = random(0, 256);
-    mask[3] = random(0, 256);
+    // Disconnect user gracefully.
+    void disconnectStream();
     
-    socket_client->write(mask[0]);
-    socket_client->write(mask[1]);
-    socket_client->write(mask[2]);
-    socket_client->write(mask[3]);
-     
-    for (int i=0; i<size; ++i) {
-        socket_client->write(str[i] ^ mask[i % 4]);
-    }
-}
+    int timedRead();
 
-void WebSocketClient::sendEncodedData(String str, uint8_t opcode) {
-    int size = str.length() + 1;
-    char cstr[size];
+    void sendEncodedData(char *str, uint8_t opcode);
+    void sendEncodedData(String str, uint8_t opcode);
+};
 
-    str.toCharArray(cstr, size);
 
-    sendEncodedData(cstr, opcode);
-}
+
+#endif
